@@ -11,7 +11,7 @@ const { useState, useEffect, useRef, useCallback } = React;
 const io = window.io;
 
 // ─── URL du backend ───────────────────────────────────────────────────────────
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
+ const API_URL = "https://corpsync-production.up.railway.app";
 
 // ─── Client HTTP générique ────────────────────────────────────────────────────
 async function api(path, options = {}, token = null) {
