@@ -478,7 +478,7 @@ function Dashboard({ user, taches, messages, docs, notifications, setPage }) {
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
-function Messages({ user, messages, setMessages, socketRef, usersStatus, utilisateurs }) {
+function Messages({ user, messages, setMessages, socketRef, usersStatus, utilisateurs, token }) {
   const [texte,        setTexte]        = useState("");
   const [autreEnTrain, setAutreEnTrain] = useState(false);
   const bottomRef   = useRef();
@@ -487,6 +487,29 @@ function Messages({ user, messages, setMessages, socketRef, usersStatus, utilisa
   const autreId   = user.id === "directeur" ? "secretaire" : "directeur";
   const autreUser = utilisateurs.find(u=>u.id===autreId) || { id:autreId, nom:autreId, avatar:"??", couleur:"#999" };
   const autreEnLigne = usersStatus.find(u=>u.id===autreId)?.en_ligne;
+
+  // ── Marquer tous les messages reçus comme lus dès l'ouverture ──────────────
+  useEffect(()=>{
+    const nonLus = messages.filter(m=>m.a===user.id&&!m.lu).length;
+    if (nonLus === 0) return;
+    api("/api/messages/lire", { method:"PUT" }, token)
+      .then(()=>{
+        // Mise à jour locale immédiate : badge disparaît sans recharger
+        setMessages(prev => prev.map(m => m.a === user.id ? { ...m, lu:1 } : m));
+      })
+      .catch(()=>{});
+  }, []); // S'exécute une seule fois à l'ouverture de la page Messages
+
+  // ── Aussi marquer lu quand un nouveau message arrive pendant qu'on est sur la page
+  useEffect(()=>{
+    const nouveauxNonLus = messages.filter(m=>m.a===user.id&&!m.lu);
+    if (nouveauxNonLus.length === 0) return;
+    // Petite pause pour laisser le message s'afficher avant de le marquer lu
+    const t = setTimeout(()=>{
+      setMessages(prev => prev.map(m => m.a === user.id ? { ...m, lu:1 } : m));
+    }, 800);
+    return () => clearTimeout(t);
+  }, [messages.length]);
 
   useEffect(()=>{ bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [messages]);
 
@@ -510,8 +533,8 @@ function Messages({ user, messages, setMessages, socketRef, usersStatus, utilisa
   const envoyer = () => {
     const s = socketRef.current;
     if (!texte.trim() || !s) return;
-    // Ajouter localement immédiatement (optimistic)
-    const tempMsg = { id:"temp_"+Date.now(), de:user.id, a:autreId, texte:texte.trim(), lu:0, created_at:new Date().toISOString(), _temp:true };
+    // Message temporaire (optimistic) affiché immédiatement
+    const tempMsg = { id:"temp_"+Date.now(), de:user.id, a:autreId, texte:texte.trim(), lu:1, created_at:new Date().toISOString(), _temp:true };
     setMessages(prev=>[...prev, tempMsg]);
     s.emit("envoyer_message", { a:autreId, texte:texte.trim() });
     s.emit("en_train_de_taper", { a:autreId, actif:false });
@@ -674,15 +697,25 @@ function Taches({ user, taches, token, onRefresh, utilisateurs }) {
 
 // ─── Documents ────────────────────────────────────────────────────────────────
 function Documents({ user, docs, token, onRefresh }) {
-  const [modal,   setModal]   = useState(false);
-  const [fichier, setFichier] = useState(null);
-  const [confirm, setConfirm] = useState(null);
-  const [uploading,setUploading]=useState(false);
-  const [drag,    setDrag]    = useState(false);
-  const inputRef = useRef();
+  const [modal,    setModal]    = useState(false);
+  const [fichier,  setFichier]  = useState(null);
+  const [confirm,  setConfirm]  = useState(null);
+  const [uploading,setUploading] = useState(false);
+  const [drag,     setDrag]     = useState(false);
+  // ID unique pour le <label> — compatible mobile sans inputRef.click()
+  const inputId = "doc-upload-input";
 
   const typeClass = t => ["xlsx","xls"].includes(t)?"doc-xlsx":["docx","doc"].includes(t)?"doc-docx":t==="pdf"?"doc-pdf":"doc-other";
-  const handleFile = f => { if(f){ setFichier(f); setModal(true); } };
+
+  const handleFile = f => { if (f && f.size > 0) { setFichier(f); setModal(true); } };
+
+  // Construit l'URL de téléchargement Cloudinary compatible mobile
+  // fl_attachment force le téléchargement au lieu d'afficher dans le navigateur
+  const buildDownloadUrl = url => {
+    if (!url) return "#";
+    // Insère fl_attachment dans l'URL Cloudinary raw
+    return url.replace("/upload/", "/upload/fl_attachment/");
+  };
 
   const ajouter = async () => {
     if (!fichier) return;
@@ -691,51 +724,87 @@ function Documents({ user, docs, token, onRefresh }) {
       const fd = new FormData();
       fd.append("fichier", fichier);
       const res = await fetch(`${API_URL}/api/documents/upload`, {
-        method:"POST", headers:{ Authorization:`Bearer ${token}` }, body:fd,
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.erreur||"Erreur upload");
+      if (!res.ok) throw new Error(data.erreur || "Erreur upload");
       setModal(false); setFichier(null); onRefresh();
-    } catch(e) { alert("Erreur : "+e.message); }
+    } catch(e) { alert("Erreur : " + e.message); }
     finally { setUploading(false); }
   };
 
-  const valider  = async id => { await api(`/api/documents/${id}/valider`,{ method:"PUT" },token); onRefresh(); };
-  const supprimer= async id => { await api(`/api/documents/${id}`,{ method:"DELETE" },token); setConfirm(null); onRefresh(); };
+  const valider   = async id => { await api(`/api/documents/${id}/valider`, { method:"PUT" }, token); onRefresh(); };
+  const supprimer = async id => { await api(`/api/documents/${id}`, { method:"DELETE" }, token); setConfirm(null); onRefresh(); };
 
   return (
     <div>
       <div className="page-header">
-        <div><div className="section-title">Documents</div><div className="text-soft mt-1">{docs.length} documents partagés</div></div>
-        <button className="btn-primary" onClick={()=>inputRef.current.click()}><Icon name="upload" size={15}/> Uploader</button>
+        <div>
+          <div className="section-title">Documents</div>
+          <div className="text-soft mt-1">{docs.length} documents partagés</div>
+        </div>
+        {/* label natif = compatible iOS/Android sans JS click() */}
+        <label htmlFor={inputId} className="btn-primary" style={{ cursor:"pointer" }}>
+          <Icon name="upload" size={15}/> Uploader
+        </label>
       </div>
-      <input ref={inputRef} type="file" style={{ display:"none" }} accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.png,.jpg,.jpeg" onChange={e=>handleFile(e.target.files[0])}/>
-      <div className={`upload-zone ${drag?"dragover":""}`}
-        onDragOver={e=>{e.preventDefault();setDrag(true)}} onDragLeave={()=>setDrag(false)}
-        onDrop={e=>{e.preventDefault();setDrag(false);handleFile(e.dataTransfer.files[0])}}
-        onClick={()=>inputRef.current.click()}>
+
+      {/* Input fichier déclenché par label — fonctionne sur mobile */}
+      <input
+        id={inputId} type="file" style={{ display:"none" }}
+        accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.png,.jpg,.jpeg"
+        onChange={e => { handleFile(e.target.files[0]); e.target.value = ""; }}
+      />
+
+      {/* Zone drag & drop (desktop uniquement) */}
+      <label htmlFor={inputId}
+        className={`upload-zone ${drag?"dragover":""}`}
+        onDragOver={e=>{e.preventDefault();setDrag(true)}}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={e=>{e.preventDefault();setDrag(false);handleFile(e.dataTransfer.files[0])}}>
         <Icon name="upload" size={28}/>
         <div style={{ marginTop:10,fontWeight:500,fontSize:13 }}>Glissez un fichier ici ou appuyez pour choisir</div>
         <div style={{ fontSize:11,marginTop:3 }}>PDF, Word, Excel, Images — 20 MB max</div>
-      </div>
+      </label>
+
       <div className="docs-grid">
         {docs.map(d=>(
           <div key={d.id} className="doc-card">
             <div className={`doc-type-icon ${typeClass(d.type)}`}>{d.type?.toUpperCase()}</div>
             <div className="doc-name">{d.nom}</div>
-            <div className="doc-info"><span>{d.taille}</span><span>·</span><span>{new Date(d.created_at).toLocaleDateString("fr-FR")}</span></div>
+            <div className="doc-info">
+              <span>{d.taille}</span><span>·</span>
+              <span>{new Date(d.created_at).toLocaleDateString("fr-FR")}</span>
+            </div>
             <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8 }}>
-              <span className={`doc-status ${d.statut==="valide"?"doc-valide":"doc-attente"}`}>{d.statut==="valide"?"✓ Validé":"⏳ En attente"}</span>
-              {d.statut==="en_attente"&&d.cree_par!==user.id&&<button className="btn-secondary btn-sm" onClick={()=>valider(d.id)}>Valider</button>}
+              <span className={`doc-status ${d.statut==="valide"?"doc-valide":"doc-attente"}`}>
+                {d.statut==="valide"?"✓ Validé":"⏳ En attente"}
+              </span>
+              {d.statut==="en_attente"&&d.cree_par!==user.id&&(
+                <button className="btn-secondary btn-sm" onClick={()=>valider(d.id)}>Valider</button>
+              )}
             </div>
             <div style={{ display:"flex",gap:5 }}>
-              {d.url&&<a href={d.url} target="_blank" rel="noreferrer"><button className="btn-icon" title="Télécharger"><Icon name="download" size={13}/></button></a>}
-              <button className="btn-icon danger" onClick={()=>setConfirm(d.id)}><Icon name="trash" size={13}/></button>
+              {d.url&&(
+                // fl_attachment garantit le téléchargement sur mobile et desktop
+                <a href={buildDownloadUrl(d.url)} download={d.nom} target="_blank" rel="noreferrer">
+                  <button className="btn-icon" title="Télécharger/Ouvrir">
+                    <Icon name="download" size={13}/>
+                  </button>
+                </a>
+              )}
+              <button className="btn-icon danger" onClick={()=>setConfirm(d.id)}>
+                <Icon name="trash" size={13}/>
+              </button>
             </div>
             <div className="text-soft mt-2" style={{ fontSize:10 }}>Partagé par {d.cree_par}</div>
           </div>
         ))}
+        {docs.length===0&&<div className="empty-state" style={{ gridColumn:"1/-1" }}>Aucun document partagé</div>}
       </div>
+
       {modal&&(
         <div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&setModal(false)}>
           <div className="modal">
@@ -1106,7 +1175,7 @@ function App() {
             {loading&&<div className="loading-page"><div className="spinner"/> Chargement...</div>}
             {!loading&&<>
               {page==="dashboard"   &&<Dashboard user={user} taches={taches} messages={messages} docs={docs} notifications={notifications} setPage={setPage}/>}
-              {page==="messages"    &&<Messages  user={user} messages={messages} setMessages={setMessages} socketRef={socketRef} usersStatus={usersStatus} utilisateurs={utilisateurs}/>}
+              {page==="messages"    &&<Messages  user={user} messages={messages} setMessages={setMessages} socketRef={socketRef} usersStatus={usersStatus} utilisateurs={utilisateurs} token={token}/>}
               {page==="taches"      &&<Taches    user={user} taches={taches} token={token} onRefresh={charger} utilisateurs={utilisateurs}/>}
               {page==="documents"   &&<Documents user={user} docs={docs} token={token} onRefresh={charger}/>}
               {page==="agenda"      &&<Agenda    user={user} agenda={agenda} token={token} onRefresh={charger}/>}
@@ -1121,5 +1190,6 @@ function App() {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<App/>);
+
 
             
