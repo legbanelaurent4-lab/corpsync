@@ -1,19 +1,19 @@
 /**
- * CorpSync — Serveur Backend v3
- * Nouveautés : Cloudinary pour upload, fix WebSocket, CRUD complet
+ * CorpSync — Serveur Backend v4
+ * Upload via Cloudinary stream (memoryStorage) — compatible Railway/mobile
  */
 
-const express    = require("express");
-const http       = require("http");
-const { Server } = require("socket.io");
-const Database   = require("better-sqlite3");
-const bcrypt     = require("bcryptjs");
-const jwt        = require("jsonwebtoken");
-const cors       = require("cors");
-const path       = require("path");
-const multer     = require("multer");
-const cloudinary = require("cloudinary").v2;
-const { CloudinaryStorage } = require("multer-storage-cloudinary");
+const express     = require("express");
+const http        = require("http");
+const { Server }  = require("socket.io");
+const Database    = require("better-sqlite3");
+const bcrypt      = require("bcryptjs");
+const jwt         = require("jsonwebtoken");
+const cors        = require("cors");
+const path        = require("path");
+const multer      = require("multer");
+const cloudinary  = require("cloudinary").v2;
+const streamifier = require("streamifier");
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 const PORT       = process.env.PORT       || 4000;
@@ -26,19 +26,9 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET || "RdFUtW4p8YgxwfMHvTEbb7pSD5Y",
 });
 
-// ─── Multer + Cloudinary Storage ─────────────────────────────────────────────
-const storage = new CloudinaryStorage({
-  cloudinary,
-  params: async (req, file) => ({
-    folder:        "corpsync_documents",
-    resource_type: "raw",
-    public_id:     Date.now() + "_" + file.originalname.replace(/\s/g, "_"),
-    use_filename:  true,
-  }),
-});
-
+// ─── Multer en mémoire — pas de disque, fonctionne sur Railway ───────────────
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowed = [".pdf",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".txt",".png",".jpg",".jpeg"];
@@ -46,6 +36,17 @@ const upload = multer({
     allowed.includes(ext) ? cb(null, true) : cb(new Error("Type non autorisé"));
   },
 });
+
+// Upload buffer vers Cloudinary via stream
+function uploadToCloudinary(buffer, options) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(options, (err, result) => {
+      if (err) return reject(err);
+      resolve(result);
+    });
+    streamifier.createReadStream(buffer).pipe(stream);
+  });
+}
 
 // ─── App + HTTP + Socket.io ───────────────────────────────────────────────────
 const app        = express();
@@ -55,7 +56,7 @@ const io         = new Server(httpServer, {
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 // ─── SQLite ───────────────────────────────────────────────────────────────────
@@ -93,15 +94,15 @@ db.exec(`
     created_at    TEXT DEFAULT (datetime('now'))
   );
   CREATE TABLE IF NOT EXISTS documents (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    nom          TEXT NOT NULL,
-    url          TEXT,
-    public_id    TEXT,
-    taille       TEXT DEFAULT '—',
-    type         TEXT NOT NULL,
-    statut       TEXT DEFAULT 'en_attente',
-    cree_par     TEXT NOT NULL,
-    created_at   TEXT DEFAULT (datetime('now'))
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    nom        TEXT NOT NULL,
+    url        TEXT,
+    public_id  TEXT,
+    taille     TEXT DEFAULT '—',
+    type       TEXT NOT NULL,
+    statut     TEXT DEFAULT 'en_attente',
+    cree_par   TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
   );
   CREATE TABLE IF NOT EXISTS agenda (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +136,7 @@ function seed() {
 }
 seed();
 
-// ─── Middlewares auth ─────────────────────────────────────────────────────────
+// ─── Middlewares ──────────────────────────────────────────────────────────────
 function auth(req, res, next) {
   const h = req.headers.authorization;
   if (!h?.startsWith("Bearer ")) return res.status(401).json({ erreur: "Token manquant" });
@@ -204,7 +205,7 @@ app.put("/api/utilisateurs/:id", auth, adminOnly, (req, res) => {
   const newAvatar = newNom.split(" ").map(w=>w[0]).join("").toUpperCase().slice(0,2);
   const newPwd = password ? bcrypt.hashSync(password,10) : u.password;
   db.prepare("UPDATE utilisateurs SET nom=?,role=?,avatar=?,couleur=?,password=? WHERE id=?")
-    .run(newNom,newRole,newAvatar,newCouleur,newPwd,req.params.id);
+    .run(newNom, newRole, newAvatar, newCouleur, newPwd, req.params.id);
   const updated = db.prepare("SELECT id,nom,role,avatar,couleur,is_admin FROM utilisateurs WHERE id=?").get(req.params.id);
   io.emit("utilisateur_modifie", updated);
   res.json(updated);
@@ -223,15 +224,18 @@ app.get("/api/utilisateurs/status", auth, (req, res) => {
 
 // ── Messages ──────────────────────────────────────────────────────
 app.get("/api/messages", auth, (req, res) => {
-  res.json(db.prepare("SELECT * FROM messages WHERE de=? OR a=? ORDER BY created_at ASC").all(req.user.id,req.user.id));
+  res.json(db.prepare("SELECT * FROM messages WHERE de=? OR a=? ORDER BY created_at ASC").all(req.user.id, req.user.id));
 });
+
 app.put("/api/messages/lire", auth, (req, res) => {
   db.prepare("UPDATE messages SET lu=1 WHERE a=?").run(req.user.id);
   res.json({ ok: true });
 });
 
 // ── Tâches ────────────────────────────────────────────────────────
-app.get("/api/taches",  auth, (req,res) => res.json(db.prepare("SELECT * FROM taches ORDER BY created_at DESC").all()));
+app.get("/api/taches", auth, (req,res) =>
+  res.json(db.prepare("SELECT * FROM taches ORDER BY created_at DESC").all())
+);
 
 app.post("/api/taches", auth, (req, res) => {
   const { titre, description, assigne_a, priorite, date_echeance } = req.body;
@@ -261,30 +265,47 @@ app.delete("/api/taches/:id", auth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Documents (Cloudinary) ────────────────────────────────────────
+// ── Documents — upload via stream Cloudinary ──────────────────────
 app.get("/api/documents", auth, (req,res) =>
   res.json(db.prepare("SELECT * FROM documents ORDER BY created_at DESC").all())
 );
 
 app.post("/api/documents/upload", auth, upload.single("fichier"), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ erreur:"Aucun fichier reçu" });
-    const ext    = path.extname(req.file.originalname).toLowerCase().replace(".","");
+    if (!req.file) return res.status(400).json({ erreur: "Aucun fichier reçu" });
+
+    const ext    = path.extname(req.file.originalname).toLowerCase().replace(".", "");
     const taille = req.file.size > 1024*1024
-      ? (req.file.size/1024/1024).toFixed(1)+" MB"
-      : Math.round(req.file.size/1024)+" KB";
-    const url       = req.file.path;
-    const public_id = req.file.filename;
-    const r  = db.prepare("INSERT INTO documents (nom,url,public_id,taille,type,cree_par) VALUES (?,?,?,?,?,?)")
-      .run(req.file.originalname, url, public_id, taille, ext, req.user.id);
+      ? (req.file.size/1024/1024).toFixed(1) + " MB"
+      : Math.round(req.file.size/1024) + " KB";
+
+    // Déterminer resource_type selon l'extension
+    const imageExts = ["png","jpg","jpeg","gif","webp"];
+    const resourceType = imageExts.includes(ext) ? "image" : "raw";
+
+    // Upload vers Cloudinary via stream (pas de fichier temporaire)
+    const result = await uploadToCloudinary(req.file.buffer, {
+      folder:        "corpsync_documents",
+      resource_type: resourceType,
+      public_id:     Date.now() + "_" + req.file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_"),
+      use_filename:  false,
+    });
+
+    // Construire URL avec fl_attachment pour forcer le téléchargement
+    const downloadUrl = result.secure_url.replace("/upload/", "/upload/fl_attachment/");
+
+    const r = db.prepare("INSERT INTO documents (nom,url,public_id,taille,type,cree_par) VALUES (?,?,?,?,?,?)")
+      .run(req.file.originalname, downloadUrl, result.public_id, taille, ext, req.user.id);
     const doc = db.prepare("SELECT * FROM documents WHERE id=?").get(r.lastInsertRowid);
+
     const autre = db.prepare("SELECT id FROM utilisateurs WHERE id!=?").get(req.user.id);
     if (autre) notifier(autre.id, `📎 Nouveau document : "${req.file.originalname}"`);
     io.emit("doc_update", doc);
+
     res.json(doc);
   } catch(e) {
     console.error("Upload error:", e);
-    res.status(500).json({ erreur: e.message });
+    res.status(500).json({ erreur: "Erreur upload : " + e.message });
   }
 });
 
@@ -298,7 +319,12 @@ app.put("/api/documents/:id/valider", auth, (req, res) => {
 app.delete("/api/documents/:id", auth, async (req, res) => {
   const doc = db.prepare("SELECT * FROM documents WHERE id=?").get(req.params.id);
   if (doc?.public_id) {
-    try { await cloudinary.uploader.destroy(doc.public_id, { resource_type:"raw" }); } catch(e) { console.error(e); }
+    try {
+      const ext = doc.type;
+      const imageExts = ["png","jpg","jpeg","gif","webp"];
+      const resourceType = imageExts.includes(ext) ? "image" : "raw";
+      await cloudinary.uploader.destroy(doc.public_id, { resource_type: resourceType });
+    } catch(e) { console.error("Cloudinary delete:", e); }
   }
   db.prepare("DELETE FROM documents WHERE id=?").run(req.params.id);
   io.emit("doc_deleted", { id: parseInt(req.params.id) });
@@ -306,12 +332,14 @@ app.delete("/api/documents/:id", auth, async (req, res) => {
 });
 
 // ── Agenda ────────────────────────────────────────────────────────
-app.get("/api/agenda",  auth, (req,res) => res.json(db.prepare("SELECT * FROM agenda ORDER BY date ASC, heure ASC").all()));
+app.get("/api/agenda", auth, (req,res) =>
+  res.json(db.prepare("SELECT * FROM agenda ORDER BY date ASC, heure ASC").all())
+);
 
 app.post("/api/agenda", auth, (req, res) => {
   const { titre,date,heure,duree,lieu,couleur } = req.body;
   if (!titre||!date||!heure) return res.status(400).json({ erreur:"Champs requis" });
-  const r  = db.prepare("INSERT INTO agenda (titre,date,heure,duree,lieu,couleur,cree_par) VALUES (?,?,?,?,?,?,?)")
+  const r = db.prepare("INSERT INTO agenda (titre,date,heure,duree,lieu,couleur,cree_par) VALUES (?,?,?,?,?,?,?)")
     .run(titre,date,heure,duree||"1h",lieu||"",couleur||"#C8A96E",req.user.id);
   const ev = db.prepare("SELECT * FROM agenda WHERE id=?").get(r.lastInsertRowid);
   const autre = db.prepare("SELECT id FROM utilisateurs WHERE id!=?").get(req.user.id);
@@ -341,6 +369,7 @@ app.delete("/api/agenda/:id", auth, (req, res) => {
 app.get("/api/notifications", auth, (req,res) =>
   res.json(db.prepare("SELECT * FROM notifications WHERE pour=? ORDER BY created_at DESC LIMIT 20").all(req.user.id))
 );
+
 app.put("/api/notifications/lire", auth, (req,res) => {
   db.prepare("UPDATE notifications SET lu=1 WHERE pour=?").run(req.user.id);
   res.json({ ok: true });
@@ -361,19 +390,18 @@ io.on("connection", (socket) => {
   io.emit("user_status", { id:uid, en_ligne:true });
   console.log(`🟢 ${socket.user.nom} connecté`);
 
-  // ── Message : stocké UNE SEULE FOIS ici, pas via /api/messages POST ──────
   socket.on("envoyer_message", ({ a, texte }) => {
     if (!texte?.trim() || !a) return;
     const r   = db.prepare("INSERT INTO messages (de,a,texte) VALUES (?,?,?)").run(uid, a, texte.trim());
     const msg = db.prepare("SELECT * FROM messages WHERE id=?").get(r.lastInsertRowid);
-    // Émettre UNIQUEMENT au destinataire (l'expéditeur ajoute lui-même localement)
     io.to(a).emit("nouveau_message", msg);
-    // Confirmer à l'expéditeur avec l'ID réel (pour éviter les doublons)
     socket.emit("message_envoye", msg);
     notifier(a, `💬 Nouveau message de ${socket.user.nom}`);
   });
 
-  socket.on("en_train_de_taper", ({ a, actif }) => io.to(a).emit("interlocuteur_tape", { de:uid, actif }));
+  socket.on("en_train_de_taper", ({ a, actif }) => {
+    io.to(a).emit("interlocuteur_tape", { de:uid, actif });
+  });
 
   socket.on("disconnect", () => {
     db.prepare("UPDATE utilisateurs SET en_ligne=0 WHERE id=?").run(uid);
@@ -384,9 +412,10 @@ io.on("connection", (socket) => {
 
 // ─── Démarrage ────────────────────────────────────────────────────
 httpServer.listen(PORT, () => {
-  console.log(`\n🚀 CorpSync v3 → http://localhost:${PORT}`);
-  console.log(`☁️  Cloudinary : ${cloudinary.config().cloud_name}`);
+  console.log(`\n🚀 CorpSync v4 → http://localhost:${PORT}`);
+  console.log(`☁️  Cloudinary cloud : ${cloudinary.config().cloud_name}`);
   console.log(`\n🔑 directeur/directeur123 | secretaire/secretaire123\n`);
 });
+
 
 
