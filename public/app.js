@@ -696,42 +696,83 @@ function Taches({ user, taches, token, onRefresh, utilisateurs }) {
 }
 
 // ─── Documents ────────────────────────────────────────────────────────────────
+// Cloudinary config (upload direct depuis le navigateur)
+const CLOUDINARY_CLOUD = "dlj4xjh5d";
+const CLOUDINARY_PRESET = "corpsync_unsigned"; // upload preset non signé
+
 function Documents({ user, docs, token, onRefresh }) {
   const [modal,    setModal]    = useState(false);
   const [fichier,  setFichier]  = useState(null);
   const [confirm,  setConfirm]  = useState(null);
   const [uploading,setUploading] = useState(false);
+  const [progress, setProgress]  = useState(0);
   const [drag,     setDrag]     = useState(false);
-  // ID unique pour le <label> — compatible mobile sans inputRef.click()
   const inputId = "doc-upload-input";
 
   const typeClass = t => ["xlsx","xls"].includes(t)?"doc-xlsx":["docx","doc"].includes(t)?"doc-docx":t==="pdf"?"doc-pdf":"doc-other";
-
   const handleFile = f => { if (f && f.size > 0) { setFichier(f); setModal(true); } };
 
-  // Construit l'URL de téléchargement Cloudinary compatible mobile
-  // fl_attachment force le téléchargement au lieu d'afficher dans le navigateur
   const buildDownloadUrl = url => {
     if (!url) return "#";
-    // Insère fl_attachment dans l'URL Cloudinary raw
     return url.replace("/upload/", "/upload/fl_attachment/");
   };
 
   const ajouter = async () => {
     if (!fichier) return;
     setUploading(true);
+    setProgress(0);
     try {
+      // ── Étape 1 : Upload direct vers Cloudinary (contourne Railway) ──
       const fd = new FormData();
-      fd.append("fichier", fichier);
-      const res = await fetch(`${API_URL}/api/documents/upload`, {
+      fd.append("file", fichier);
+      fd.append("upload_preset", CLOUDINARY_PRESET);
+      fd.append("folder", "corpsync_documents");
+
+      // Utiliser XMLHttpRequest pour avoir la progression
+      const cloudResult = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/raw/upload`);
+        xhr.upload.onprogress = e => {
+          if (e.lengthComputable) setProgress(Math.round(e.loaded/e.total*80));
+        };
+        xhr.onload = () => {
+          if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+          else reject(new Error("Erreur Cloudinary : " + xhr.responseText));
+        };
+        xhr.onerror = () => reject(new Error("Connexion impossible à Cloudinary"));
+        xhr.send(fd);
+      });
+
+      setProgress(85);
+
+      // URL avec fl_attachment pour forcer le téléchargement
+      const downloadUrl = cloudResult.secure_url.replace("/upload/", "/upload/fl_attachment/");
+      const ext    = fichier.name.split(".").pop().toLowerCase();
+      const taille = fichier.size > 1024*1024
+        ? (fichier.size/1024/1024).toFixed(1)+" MB"
+        : Math.round(fichier.size/1024)+" KB";
+
+      // ── Étape 2 : Enregistrer en base via notre API ──
+      const res = await fetch(`${API_URL}/api/documents`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${token}` },
-        body: fd,
+        headers: { "Content-Type":"application/json", Authorization:`Bearer ${token}` },
+        body: JSON.stringify({
+          nom:       fichier.name,
+          url:       downloadUrl,
+          public_id: cloudResult.public_id,
+          taille,
+          type:      ext,
+        }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.erreur || "Erreur upload");
-      setModal(false); setFichier(null); onRefresh();
-    } catch(e) { alert("Erreur : " + e.message); }
+      if (!res.ok) throw new Error(data.erreur || "Erreur serveur");
+
+      setProgress(100);
+      setTimeout(() => { setModal(false); setFichier(null); setProgress(0); onRefresh(); }, 500);
+    } catch(e) {
+      alert("Erreur upload : " + e.message);
+      setProgress(0);
+    }
     finally { setUploading(false); }
   };
 
@@ -815,10 +856,20 @@ function Documents({ user, docs, token, onRefresh }) {
                 {fichier?(fichier.size>1024*1024?(fichier.size/1024/1024).toFixed(1)+" MB":Math.round(fichier.size/1024)+" KB"):""}
               </div>
             </div>
+            {uploading && (
+              <div style={{ marginBottom:16 }}>
+                <div style={{ display:"flex",justifyContent:"space-between",fontSize:12,color:"var(--text-soft)",marginBottom:6 }}>
+                  <span>Envoi en cours...</span><span>{progress}%</span>
+                </div>
+                <div style={{ background:"var(--border)",borderRadius:20,height:6,overflow:"hidden" }}>
+                  <div style={{ background:"var(--gold)",height:"100%",width:progress+"%",borderRadius:20,transition:"width 0.3s" }}/>
+                </div>
+              </div>
+            )}
             <div className="modal-actions">
-              <button className="btn-secondary" onClick={()=>{setModal(false);setFichier(null);}}>Annuler</button>
+              <button className="btn-secondary" onClick={()=>{setModal(false);setFichier(null);}} disabled={uploading}>Annuler</button>
               <button className="btn-primary" onClick={ajouter} disabled={uploading}>
-                {uploading?<><span className="spinner"/> Envoi en cours...</>:"Envoyer le fichier"}
+                {uploading ? <><span className="spinner"/> {progress}%</> : "Envoyer le fichier"}
               </button>
             </div>
           </div>
@@ -1190,6 +1241,3 @@ function App() {
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(<App/>);
-
-
-            
