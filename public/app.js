@@ -728,18 +728,30 @@ function Documents({ user, docs, token, onRefresh }) {
       fd.append("upload_preset", CLOUDINARY_PRESET);
       fd.append("folder", "corpsync_documents");
 
+      // Détecter le type pour choisir le bon endpoint Cloudinary
+      const imageExts = ["png","jpg","jpeg","gif","webp"];
+      const fileExt   = fichier.name.split(".").pop().toLowerCase();
+      const resType   = imageExts.includes(fileExt) ? "image" : "raw";
+
       // Utiliser XMLHttpRequest pour avoir la progression
       const cloudResult = await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        xhr.open("POST", `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/raw/upload`);
+        xhr.open("POST", `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/${resType}/upload`);
         xhr.upload.onprogress = e => {
           if (e.lengthComputable) setProgress(Math.round(e.loaded/e.total*80));
         };
         xhr.onload = () => {
-          if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
-          else reject(new Error("Erreur Cloudinary : " + xhr.responseText));
+          if (xhr.status === 200) {
+            resolve(JSON.parse(xhr.responseText));
+          } else {
+            let msg = "Erreur Cloudinary";
+            try { msg = JSON.parse(xhr.responseText).error?.message || msg; } catch(e) {}
+            reject(new Error(msg));
+          }
         };
         xhr.onerror = () => reject(new Error("Connexion impossible à Cloudinary"));
+        xhr.ontimeout = () => reject(new Error("Timeout — fichier trop lourd ou connexion lente"));
+        xhr.timeout = 120000; // 2 minutes max
         xhr.send(fd);
       });
 
